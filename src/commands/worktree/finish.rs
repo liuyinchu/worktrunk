@@ -7,9 +7,9 @@
 //! 1. Capture the feature worktree's path + commit BEFORE removal — afterward
 //!    the worktree directory is gone, but post-merge hooks still need to
 //!    reference it via Active template overrides.
-//! 2. Decide whether to remove the feature worktree. Five conditions block
+//! 2. Decide whether to remove the feature worktree. Six conditions block
 //!    removal: `--no-remove`, on-target, primary-worktree, locked, and
-//!    default-branch. Otherwise `ensure_clean` gates removal and
+//!    default-branch, and nested worktrees. Otherwise `ensure_clean` gates removal and
 //!    `handle_remove_output` performs it (sharing the same code path as
 //!    `wt remove`).
 //! 3. Register the post-merge hook with the announcer. The caller owns
@@ -26,6 +26,7 @@ use std::path::Path;
 use worktrunk::HookType;
 use worktrunk::config::UserConfig;
 use worktrunk::git::{BranchDeletionMode, Repository};
+use worktrunk::path::format_path_for_display;
 use worktrunk::styling::{eprintln, info_message};
 
 use super::types::{RemovalPlan, SharedBranchCheckout};
@@ -46,6 +47,7 @@ use crate::output::{
 /// Inputs to [`finish_after_merge`]. Owned by the caller; this struct just
 /// bundles them so the function signature stays readable.
 pub struct FinishAfterMergeArgs<'a> {
+    pub source_is_current: bool,
     pub current_branch: &'a str,
     pub target_branch: &'a str,
     pub target_worktree_path: Option<&'a Path>,
@@ -74,6 +76,7 @@ pub fn finish_after_merge(
 ) -> anyhow::Result<bool> {
     let FinishAfterMergeArgs {
         current_branch,
+        source_is_current,
         target_branch,
         target_worktree_path,
         remove,
@@ -136,6 +139,16 @@ pub fn finish_after_merge(
         };
         eprintln!("{}", info_message(msg));
         false
+    } else if let Some(nested) = worktrunk::git::remove::nested_worktree(repo, &env.worktree_path)?
+    {
+        eprintln!(
+            "{}",
+            info_message(format!(
+                "Worktree preserved (contains worktree @ {})",
+                format_path_for_display(&nested)
+            ))
+        );
+        false
     } else {
         // Phase 3: reject removing default branch (merge always uses SafeDelete).
         check_not_default_branch(repo, current_branch, &BranchDeletionMode::SafeDelete)?;
@@ -182,7 +195,7 @@ pub fn finish_after_merge(
         let remove_result = RemovalPlan::Worktree {
             main_path: destination_path.clone(),
             worktree_path: worktree_root,
-            changed_directory: true,
+            changed_directory: source_is_current,
             branch_name: Some(current_branch.to_string()),
             deletion_mode,
             target_branch: display_target,
@@ -218,7 +231,7 @@ pub fn finish_after_merge(
             &destination_path,
             yes,
         );
-        let display_path = if removed {
+        let display_path = if removed && source_is_current {
             post_hook_display_path(&destination_path)
         } else {
             pre_hook_display_path(&destination_path)
