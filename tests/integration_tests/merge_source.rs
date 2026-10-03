@@ -142,11 +142,17 @@ post-switch = "echo switched > '{}'"
     wait_for_file_content(&removed);
     assert_eq!(
         fs::read_to_string(pre).unwrap(),
-        format!("feature:{}", source.to_slash_lossy())
+        format!(
+            "feature:{}",
+            worktrunk::path::to_posix_path(&source.to_string_lossy())
+        )
     );
     assert_eq!(
         fs::read_to_string(post).unwrap(),
-        format!("feature:{}:main", source.to_slash_lossy())
+        format!(
+            "feature:{}:main",
+            worktrunk::path::to_posix_path(&source.to_string_lossy())
+        )
     );
     assert_eq!(fs::read_to_string(removed).unwrap(), "feature");
     // Successful background hooks prove the pipeline had a chance to run.
@@ -190,7 +196,7 @@ fn test_merge_source_selected_by_path_or_current_alias(mut repo: TestRepo, #[cas
     wait_for_worktree_removed(&source);
     let cd = fs::read_to_string(directive).unwrap();
     if current {
-        assert_eq!(cd.trim(), repo.root_path().to_str().unwrap());
+        assert_eq!(cd.trim(), repo.root_path().to_slash_lossy());
     } else {
         assert!(cd.is_empty());
     }
@@ -509,7 +515,13 @@ fn test_merge_source_preserves_nested_worktree(mut repo: TestRepo, #[case] invok
 }
 
 #[rstest]
-fn test_merge_source_rechecks_nested_worktree_after_pre_remove(mut repo: TestRepo) {
+#[case(Some("feature"))]
+#[case(Some("@"))]
+#[case(None)]
+fn test_merge_source_rechecks_nested_worktree_after_pre_remove(
+    mut repo: TestRepo,
+    #[case] selector: Option<&str>,
+) {
     repo.commit_in_worktree(
         repo.root_path(),
         ".gitignore",
@@ -522,11 +534,20 @@ fn test_merge_source_rechecks_nested_worktree_after_pre_remove(mut repo: TestRep
 "#).unwrap();
     repo.run_git_in(&source, &["add", ".config/wt.toml"]);
     repo.run_git_in(&source, &["commit", "-m", "Add pre-remove hook"]);
-    let output = repo
-        .wt_command()
-        .args(["merge", "--branch", "feature", "--no-commit", "--yes"])
-        .output()
-        .unwrap();
+    let directive = repo.home_path().join("directive");
+    fs::write(&directive, "").unwrap();
+    let mut command = repo.wt_command();
+    command
+        .args(["merge", "--no-commit", "--yes"])
+        .env("WORKTRUNK_DIRECTIVE_CD_FILE", &directive);
+    if selector != Some("feature") {
+        command.current_dir(&source);
+    }
+    if let Some(selector) = selector {
+        command.args(["--branch", selector]);
+    }
+    let output = command.output().unwrap();
+    assert_eq!(fs::read_to_string(directive).unwrap(), "");
     assert!(
         !output.status.success(),
         "cleanup must refuse a new nested worktree: {output:?}"
@@ -578,6 +599,89 @@ fn test_merge_source_current_bare_worktree_emits_directory_change(#[case] explic
     wait_for_worktree_removed(&source);
     assert_eq!(
         fs::read_to_string(directive).unwrap().trim(),
-        main.to_str().unwrap()
+        main.to_slash_lossy()
+    );
+}
+
+/// A topology read can wait behind another registry teardown. A write made
+/// during that read must still be seen by the final dirty-worktree gate.
+#[cfg(unix)]
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_merge_source_checks_dirt_after_final_topology_read(
+    mut repo: TestRepo,
+    #[case] source_is_current: bool,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = repo.add_feature();
+    let phase = repo.home_path().join("pre-remove-ran");
+    let reached = repo.home_path().join("topology-read-ran");
+    let late_file = source.join("late-untracked.txt");
+    fs::create_dir_all(source.join(".config")).unwrap();
+    let hook = format!(
+        "touch {}",
+        shell_escape::unix::escape(phase.to_string_lossy())
+    );
+    fs::write(
+        source.join(".config/wt.toml"),
+        format!("pre-remove = {}\n", serde_json::to_string(&hook).unwrap()),
+    )
+    .unwrap();
+    repo.run_git_in(&source, &["add", ".config/wt.toml"]);
+    repo.run_git_in(&source, &["commit", "-m", "Add pre-remove marker"]);
+
+    let wrapper = repo.home_path().join("git-wrapper");
+    fs::create_dir_all(&wrapper).unwrap();
+    let real_git = which::which("git").unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" = 'worktree list' ] && [ -f {phase} ] && [ ! -f {reached} ]; then
+  printf '%s' 'written during topology read' > {late_file}
+  touch {reached}
+fi
+exec {real_git} "$@"
+"#,
+        phase = shell_escape::unix::escape(phase.to_string_lossy()),
+        reached = shell_escape::unix::escape(reached.to_string_lossy()),
+        late_file = shell_escape::unix::escape(late_file.to_string_lossy()),
+        real_git = shell_escape::unix::escape(real_git.to_string_lossy()),
+    );
+    let wrapper_git = wrapper.join("git");
+    fs::write(&wrapper_git, script).unwrap();
+    fs::set_permissions(&wrapper_git, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![wrapper];
+    path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let mut command = repo.wt_command();
+    command
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .args([
+            "merge",
+            "--branch",
+            if source_is_current { "@" } else { "feature" },
+            "--no-commit",
+            "--yes",
+        ]);
+    if source_is_current {
+        command.current_dir(&source);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        reached.exists(),
+        "final topology recheck was not reached: {output:?}"
+    );
+    assert!(
+        !output.status.success(),
+        "late write must block cleanup: {output:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("uncommitted changes"));
+    assert_eq!(
+        fs::read_to_string(&late_file).unwrap(),
+        "written during topology read"
+    );
+    assert_eq!(
+        repo.git_output(&["rev-parse", "main"]),
+        git_in(&repo, &source, &["rev-parse", "HEAD"])
     );
 }

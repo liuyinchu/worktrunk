@@ -10,7 +10,7 @@
 //! 2. Decide whether to remove the feature worktree. Six conditions block
 //!    removal: `--no-remove`, on-target, primary-worktree, locked, and
 //!    default-branch, and nested worktrees. Otherwise `ensure_clean` gates removal and
-//!    `handle_remove_output` performs it (sharing the same code path as
+//!    `handle_merge_remove_output` performs it (sharing the staging path with
 //!    `wt remove`).
 //! 3. Register the post-merge hook with the announcer. The caller owns
 //!    `flush()` because it's a command-level lifecycle operation, not part of
@@ -39,10 +39,7 @@ use crate::commands::repository_ext::{
     live_sibling_checkout,
 };
 use crate::commands::template_vars::TemplateVars;
-use crate::output::{
-    BackgroundFallbackMode, RemovalExecution, handle_remove_output, post_hook_display_path,
-    pre_hook_display_path,
-};
+use crate::output::{handle_merge_remove_output, post_hook_display_path, pre_hook_display_path};
 
 /// Inputs to [`finish_after_merge`]. Owned by the caller; this struct just
 /// bundles them so the function signature stays readable.
@@ -207,13 +204,7 @@ pub fn finish_after_merge(
         // The fate is dropped: merge's own reporting (`removed` in the JSON
         // blob, the removal messages) doesn't itemize the branch, and the
         // handler has already narrated any retention.
-        handle_remove_output(
-            &remove_result,
-            RemovalExecution::Background(BackgroundFallbackMode::Detached),
-            plan,
-            false,
-            announcer,
-        )?;
+        handle_merge_remove_output(&remove_result, plan, announcer)?;
         true
     };
 

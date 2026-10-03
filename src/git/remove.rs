@@ -4,7 +4,7 @@
 //!
 //! - [`stage_worktree_removal`] — the ordered prelude every removal path runs
 //!   in the foreground before the worktree directory stops existing: the
-//!   nested-worktree and dirty-worktree gates, the fsmonitor stop, then the
+//!   dirty-worktree gate, the fsmonitor stop, then the
 //!   rename into trash. It owns the gates, so it is the one place removal's
 //!   data safety is decided.
 //! - [`remove_worktree_with_cleanup`] — that prelude, plus the direct-removal
@@ -24,10 +24,7 @@
 //! Steps 1-3 are [`stage_worktree_removal`]; 4-5 are the rest of
 //! [`remove_worktree_with_cleanup`].
 //!
-//! 1. **Topology, lock and clean checks**. A fresh registry snapshot refuses
-//!    any nested worktree before the final ownership, lock and dirt checks.
-//!    Ignored nested worktrees are independent data, not removable artifacts.
-//!    A `git worktree lock` is refused
+//! 1. **Lock and clean checks**. A `git worktree lock` is refused
 //!    unconditionally (matching `git worktree remove`; `--force` does not
 //!    override it). The dirty-worktree gate is skipped with
 //!    [`RemoveOptions::force_worktree`]. Why the dirty gate precedes the
@@ -104,7 +101,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use color_print::cformat;
 
 use crate::git::repository::WorkingTree;
 use crate::git::{GitError, IntegrationReason, Repository, WorktreeInfo, path_dir_name};
@@ -460,7 +456,7 @@ pub fn remove_worktree_with_cleanup(
 ///
 /// # Errors
 ///
-/// The nested-worktree, ownership, lock, and dirty-worktree gates error. A
+/// The ownership, lock, and dirty-worktree gates error. A
 /// failed rename is reported as `None`, not an error, and the daemon stop is
 /// best-effort throughout.
 pub fn stage_worktree_removal(
@@ -469,17 +465,6 @@ pub fn stage_worktree_removal(
     branch: Option<&str>,
     force_worktree: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
-    // The fresh registry snapshot may wait for another removal's teardown.
-    // Take it before the final ownership/lock/dirty checks, so edits made
-    // during that wait cannot slip past an earlier clean result.
-    if let Some(nested) = nested_worktree(repo, worktree_path)? {
-        anyhow::bail!(cformat!(
-            "Cannot remove worktree @ <bold>{}</>; contains worktree @ <bold>{}</>",
-            format_path_for_display(worktree_path),
-            format_path_for_display(&nested)
-        ));
-    }
-
     let worktree = repo.worktree_at(worktree_path);
     worktree.ensure_holds_this_worktree()?;
 
@@ -515,8 +500,10 @@ pub fn stage_worktree_removal(
 /// Canonical paths catch registrations made through symlinks; a missing entry
 /// has no directory to protect, while other resolution errors fail closed.
 ///
-/// Called during merge's cleanup decision, and again immediately before every
-/// removal to catch a worktree created by an approved pre-remove hook.
+/// Called only by merge cleanup: once while deciding whether to remove, then
+/// again after approved pre-remove hooks and before the final removal gates.
+/// Keep this live registry read out of `stage_worktree_removal`: batch prune
+/// staging must not wait for another removal's registry teardown (#3954).
 pub fn nested_worktree(repo: &Repository, worktree_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let root =
         dunce::canonicalize(worktree_path).context("Failed to resolve worktree for removal")?;
@@ -785,24 +772,15 @@ mod tests {
     }
 
     #[test]
-    fn stage_refuses_nested_worktree_even_with_force() {
+    fn nested_worktree_reads_fresh_topology() {
         let mut test = TestRepo::with_initial_commit();
         let source = test.add_worktree("source");
-        let nested = test.add_worktree_at_path("nested", &source.join("nested"));
-        std::fs::write(nested.join("precious.txt"), "keep").unwrap();
         let repo = Repository::at(test.root_path()).unwrap();
         // Warm the cache before adding another checkout: the guard must read
         // topology after planning, independently of that cache.
         repo.list_worktrees().unwrap();
         let late = test.add_worktree_at_path("late", &source.join("late"));
-        let err = stage_worktree_removal(&repo, &source, Some("source"), true).unwrap_err();
-        assert!(err.to_string().contains("contains worktree"), "{err:?}");
-        assert_eq!(
-            std::fs::read_to_string(nested.join("precious.txt")).unwrap(),
-            "keep"
-        );
-        assert!(late.join(".git").exists());
-        assert!(source.join(".git").exists());
+        assert_eq!(nested_worktree(&repo, &source).unwrap(), Some(late));
     }
 
     #[cfg(unix)]
@@ -817,10 +795,40 @@ mod tests {
         assert_eq!(nested_worktree(&repo, &alias).unwrap(), Some(nested));
     }
 
-    /// A topology snapshot must be available before staging: another
-    /// worktree may be nested under the path about to be renamed.
     #[test]
-    fn staging_waits_for_registry_snapshot() {
+    fn nested_worktree_skips_missing_checkout() {
+        let mut test = TestRepo::with_initial_commit();
+        let source = test.add_worktree("source");
+        let nested = test.add_worktree_at_path("nested", &source.join("nested"));
+        std::fs::rename(&nested, test.root_path().parent().unwrap().join("saved")).unwrap();
+        let repo = Repository::at(test.root_path()).unwrap();
+        assert_eq!(nested_worktree(&repo, &source).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_worktree_refuses_unresolvable_checkout() {
+        let mut test = TestRepo::with_initial_commit();
+        let source = test.add_worktree("source");
+        let nested = test.add_worktree_at_path("nested", &source.join("nested"));
+        let saved = test.root_path().parent().unwrap().join("saved");
+        std::fs::rename(&nested, &saved).unwrap();
+        // A symlink loop is an actual resolution error, not evidence that the
+        // registered checkout is absent. Refuse cleanup rather than skip it.
+        std::os::unix::fs::symlink(&nested, &nested).unwrap();
+        let repo = Repository::at(test.root_path()).unwrap();
+        let err = nested_worktree(&repo, &source).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to resolve worktree @"),
+            "{err:?}"
+        );
+        assert!(saved.join(".git").exists());
+    }
+
+    /// Registry serialization starts after the fast-path rename, so worktree
+    /// staging can overlap while metadata teardown remains exclusive.
+    #[test]
+    fn stages_worktree_before_waiting_for_registry_lock() {
         let mut test = TestRepo::with_initial_commit();
         let worktree_path = test.add_worktree("feature");
         let repo = Repository::at(test.root_path()).unwrap();
@@ -828,56 +836,25 @@ mod tests {
         let worker_path = worktree_path.clone();
 
         let registry_guard = repo.worktree_registry_write();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
             stage_worktree_removal(&worker_repo, &worker_path, Some("feature"), false)
         });
 
-        started_rx.recv().unwrap();
-        std::thread::sleep(crate::testing::SLEEP_FOR_ABSENCE_CHECK);
-        let preserved_before_unlock = worktree_path.exists();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while worktree_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let renamed_before_unlock = !worktree_path.exists();
 
         drop(registry_guard);
         let result = worker.join().expect("staging thread should not panic");
         assert!(
-            preserved_before_unlock,
-            "worktree must not be staged before the topology read; result: {result:?}"
+            renamed_before_unlock,
+            "worktree should be renamed before registry teardown acquires the lock; result: {result:?}"
         );
         assert!(
             result.unwrap().is_some(),
             "worktree should use the rename fast path"
-        );
-    }
-
-    #[test]
-    fn stage_rechecks_dirt_after_waiting_for_registry_snapshot() {
-        let mut test = TestRepo::with_initial_commit();
-        let source = test.add_worktree("source");
-        let repo = Repository::at(test.root_path()).unwrap();
-        let worker_repo = repo.clone();
-        let worker_path = source.clone();
-        let registry_guard = repo.worktree_registry_write();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            stage_worktree_removal(&worker_repo, &worker_path, Some("source"), false)
-        });
-        started_rx.recv().unwrap();
-        std::thread::sleep(crate::testing::SLEEP_FOR_ABSENCE_CHECK);
-        std::fs::write(source.join("precious.txt"), "created during registry wait").unwrap();
-        drop(registry_guard);
-        let err = worker.join().unwrap().unwrap_err();
-        assert!(
-            matches!(
-                err.downcast_ref::<GitError>(),
-                Some(GitError::UncommittedChanges { .. })
-            ),
-            "{err:?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(source.join("precious.txt")).unwrap(),
-            "created during registry wait"
         );
     }
 
