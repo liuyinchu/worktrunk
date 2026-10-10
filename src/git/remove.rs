@@ -27,8 +27,9 @@
 //! 1. **Lock and clean checks**. A `git worktree lock` is refused
 //!    unconditionally (matching `git worktree remove`; `--force` does not
 //!    override it). The dirty-worktree gate is skipped with
-//!    [`RemoveOptions::force_worktree`]. Why the dirty gate precedes the
-//!    stop below: [`stage_worktree_removal`], "Why this order".
+//!    [`RemoveOptions::force_worktree`], which reports the current uncommitted
+//!    paths, or why they could not be read, before deletion instead. Why the
+//!    dirty gate precedes the stop below: [`stage_worktree_removal`], "Why this order".
 //! 2. **fsmonitor daemon stopped** (best effort). [`stop_fsmonitor_daemon`]
 //!    runs against the target worktree before its path disappears: it sends
 //!    the graceful `git fsmonitor--daemon stop` IPC request, then verifies the
@@ -103,9 +104,10 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use crate::git::repository::WorkingTree;
-use crate::git::{GitError, IntegrationReason, Repository, WorktreeInfo, path_dir_name};
+use crate::git::{ErrorExt, GitError, IntegrationReason, Repository, WorktreeInfo, path_dir_name};
 use crate::path::format_path_for_display;
 use crate::shell_exec::Cmd;
+use crate::styling::{eprintln, format_with_gutter, warning_message};
 use crate::utils::epoch_now;
 
 /// Bound on the graceful `git fsmonitor--daemon stop` IPC request.
@@ -466,7 +468,7 @@ pub fn stage_worktree_removal(
     force_worktree: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
     let worktree = repo.worktree_at(worktree_path);
-    worktree.ensure_holds_this_worktree()?;
+    let git_dir = worktree.ensure_holds_this_worktree()?;
 
     // Lock is the user's explicit "don't remove this". `--force` does not
     // override it, matching `git worktree remove` and `prepare_worktree_removal`.
@@ -485,13 +487,38 @@ pub fn stage_worktree_removal(
         .into());
     }
 
-    if !force_worktree {
+    if force_worktree {
+        // Disclosure does not veto the force removal, but an interrupted
+        // status command still cancels before any directory is removed.
+        match worktree.dirty_files() {
+            Ok(dirty_files) if !dirty_files.is_empty() => {
+                eprintln!(
+                    "{}",
+                    warning_message("Discarding uncommitted changes (--force):")
+                );
+                eprintln!("{}", format_with_gutter(&dirty_files.join("\n"), None));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if error.interrupt_signal().is_some() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "{}",
+                    warning_message(
+                        "Cannot list uncommitted changes; discarding worktree contents (--force):"
+                    )
+                );
+                eprintln!("{}", format_with_gutter(&error.display_message(), None));
+            }
+        }
+    } else {
         worktree.ensure_clean("remove worktree", branch, true)?;
     }
 
     stop_fsmonitor_daemon(&repo.worktree_at(worktree_path));
 
-    Ok(rename_into_trash(repo, worktree_path))
+    Ok(rename_into_trash(repo, worktree_path, &git_dir))
 }
 
 /// Find a registered worktree contained in `worktree_path`, using a fresh
@@ -539,12 +566,17 @@ pub fn nested_worktree(repo: &Repository, worktree_path: &Path) -> anyhow::Resul
 /// sweeping the repository, so a sibling worktree whose directory happens to
 /// be absent right now keeps its registration. A locked worktree never reaches
 /// here — [`stage_worktree_removal`] rejects one before the rename.
-fn rename_into_trash(repo: &Repository, worktree_path: &Path) -> Option<PathBuf> {
+fn rename_into_trash(repo: &Repository, worktree_path: &Path, git_dir: &Path) -> Option<PathBuf> {
     let trash_dir = repo.wt_trash_dir();
     let _ = std::fs::create_dir_all(&trash_dir);
-    let staged_path = generate_removing_path(&trash_dir, worktree_path);
+    let staged_path = generate_removing_path(&trash_dir, git_dir);
 
-    if std::fs::rename(worktree_path, &staged_path).is_ok() {
+    if std::fs::rename(worktree_path, &staged_path)
+        .inspect_err(|e| {
+            tracing::debug!(error = %e, "Failed to stage worktree into trash, falling back: {e}");
+        })
+        .is_ok()
+    {
         // The rename moved the directory out from under `worktree_path`,
         // leaving its registration stale for the prune to delete.
         if let Err(e) = repo.prune_worktree_entry(worktree_path) {
@@ -714,10 +746,16 @@ fn cas_delete_branch_outcome(
 /// worktrees on different mount points will get EXDEV and fall back to the
 /// `git worktree remove` path.
 ///
-/// Format: `<trash-dir>/<name>-<timestamp>`
-pub(crate) fn generate_removing_path(trash_dir: &Path, worktree_path: &Path) -> PathBuf {
+/// Format: `<trash-dir>/<name>-<timestamp>`, where `<name>` is the final
+/// component of the worktree's `git_dir`: its registration id under
+/// `<common>/worktrees/`, which git keeps unique among a repository's
+/// worktrees. The directory's basename is not unique — Codex places every
+/// worktree at `<id>/<repo>` — and two removals sharing a staging path in the
+/// same second would make the second rename fail onto the synchronous
+/// fallback.
+pub(crate) fn generate_removing_path(trash_dir: &Path, git_dir: &Path) -> PathBuf {
     let timestamp = epoch_now();
-    let name = worktree_path
+    let name = git_dir
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
@@ -1148,11 +1186,11 @@ mod tests {
     #[test]
     fn test_generate_removing_path() {
         let trash_dir = PathBuf::from("/some/path/.git/wt/trash");
-        let path = PathBuf::from("/foo/bar/feature-branch");
-        let removing_path = generate_removing_path(&trash_dir, &path);
-        // Format: <trash>/<name>-<timestamp>
+        let git_dir = PathBuf::from("/some/path/.git/worktrees/repo1");
+        let removing_path = generate_removing_path(&trash_dir, &git_dir);
+        // Format: <trash>/<registration>-<timestamp>
         let name = removing_path.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("feature-branch-"));
+        assert!(name.starts_with("repo1-"));
         assert!(removing_path.starts_with(&trash_dir));
     }
 

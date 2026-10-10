@@ -101,9 +101,10 @@ pub use remove::{
 pub use repository::sha_cache;
 pub use repository::{
     Branch, BranchDiffSpec, CommitMessageDetail, InProgressOperation, IntegrationTargets,
-    PreparedDiff, RefSnapshot, Repository, ResolvedWorktree, Selector, StaleWorktreeWork,
-    TempIndex, WorkingTree, duplicated_branches, is_valid_branch_name, normalize_selector,
-    resolve_input_path, select_comparison_base, set_base_path,
+    PreparedDiff, RefSnapshot, Repository, ResolvedWorktree, SafetyBackup, Selector,
+    StaleWorktreeWork, TempIndex, WorkingTree, base_path, duplicated_branches,
+    is_valid_branch_name, normalize_selector, resolve_input_path, select_comparison_base,
+    set_base_path,
 };
 pub use url::parse_owner_repo;
 pub use url::{GitRemoteUrl, GitRepoInfo, GitRepoProvider};
@@ -272,7 +273,7 @@ pub fn check_integration(signals: &IntegrationSignals) -> Option<IntegrationReas
 /// For batch operations, use parallel tasks to build [`IntegrationSignals`] directly.
 ///
 /// Resolves both `branch` and `target` to commit SHAs via `snapshot` so the
-/// integration probes are immune to ambient ref→SHA cache staleness — this
+/// integration probes read the ref state the caller captured — this
 /// is the safety contract that lets `wt merge`'s post-update-ref check
 /// observe the new local target SHA instead of the pre-merge value.
 /// Refs not in the snapshot (typically transient HEAD commits during a

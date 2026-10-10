@@ -42,7 +42,7 @@ use worktrunk::styling::{
 
 use super::shell_integration::{
     compute_shell_warning_reason, explicit_path_hint, git_subcommand_warning,
-    print_shell_integration_hint, should_show_explicit_path_hint,
+    print_shell_activation_hint, should_show_explicit_path_hint,
 };
 
 // ============================================================================
@@ -190,7 +190,6 @@ fn spawn_background_removal(
             remove_command,
             log_label,
             &HookLog::Internal(operation),
-            None,
         )
         .map(|_| ())
     };
@@ -668,6 +667,15 @@ fn handle_switch_existing_output(ctx: &SwitchOutputContext) -> Option<PathBuf> {
             ))
         );
         print_switch_directory_hint(&ctx.branch, ctx.is_git_subcommand);
+    } else if ctx.user_wont_be_in_worktree {
+        eprintln!(
+            "{}",
+            info_message(cformat!(
+                "Worktree for <bold>{}</> @ <bold>{}</> (directory change disabled)",
+                ctx.branch,
+                ctx.path_display
+            ))
+        );
     } else {
         eprintln!(
             "{}",
@@ -1019,7 +1027,7 @@ fn print_switch_message_if_changed(
         } else if should_show_explicit_path_hint() {
             eprintln!("{}", hint_message(explicit_path_hint(&dest_branch)));
         } else {
-            print_shell_integration_hint(&repo);
+            print_shell_activation_hint(&repo);
         }
     }
     Ok(())
@@ -1949,7 +1957,7 @@ fn handle_detached_removed_worktree_output(
             branch: path_dir_name(ctx.worktree_path).to_string(),
             path: ctx.worktree_path.to_path_buf(),
             remaining_entries: list_remaining_entries(ctx.worktree_path),
-            error: err.display_message(),
+            error: err,
         })?;
         let (files, bytes) = output
             .staged_path
@@ -2028,7 +2036,7 @@ fn handle_named_removed_worktree_foreground(
         branch: branch_name.into(),
         path: ctx.worktree_path.to_path_buf(),
         remaining_entries: list_remaining_entries(ctx.worktree_path),
-        error: err.display_message(),
+        error: err,
     })?;
     let stats = output
         .staged_path
@@ -2216,8 +2224,20 @@ fn remove_removed_worktree_silently(
 /// detached) have their own spawning logic.
 ///
 /// Capabilities: optional stdout→stderr redirect for deterministic ordering,
-/// SIGINT/SIGTERM forwarding to child process group, ANSI reset before child
+/// native Ctrl-C and direct-child SIGTERM delivery, ANSI reset before child
 /// runs, `Cmd` tracing/logging, and CD directive control.
+///
+/// ## Stdin
+///
+/// The child inherits the parent's stdin for interactive input. Foreground children
+/// share the caller's process group independently of stdin, so a `pre-*` hook
+/// can `gum confirm`, and an alias body's `wt switch` picker can drive `/dev/tty`.
+///
+/// Nothing is ever written to that stdin — a hook reads its context through
+/// template variables, whatever form it runs in. The two forms that can't be
+/// interactive close stdin instead, in their own spawn paths: concurrent groups
+/// in `output/concurrent.rs`, detached `post-*` pipelines in
+/// `commands/run_pipeline.rs`.
 ///
 /// ## Directive files
 ///
@@ -2261,7 +2281,6 @@ fn remove_removed_worktree_silently(
 pub fn execute_shell_command(
     working_dir: &std::path::Path,
     command: &str,
-    stdin_content: Option<&str>,
     command_log_label: Option<&str>,
     directives: DirectivePassthrough,
     redirect_stdout_to_stderr: bool,
@@ -2295,16 +2314,10 @@ pub fn execute_shell_command(
         cmd = cmd.external(label);
     }
 
-    if let Some(content) = stdin_content {
-        cmd = cmd.stdin_bytes(content);
-    } else {
-        // Inherit the parent's stdin so interactive children (e.g. TUI
-        // pickers) keep their controlling terminal. `inherit_stdin()` also
-        // keeps the child in the parent's process group so `tcsetattr` on
-        // `/dev/tty` succeeds — see the method's doc comment for the
-        // SIGTTOU rationale.
-        cmd = cmd.inherit_stdin();
-    }
+    // Inherit the parent's stdin so interactive children (e.g. TUI pickers,
+    // a `gum confirm` in a hook body) keep their controlling terminal — see
+    // the "Stdin" section of this function's docs.
+    cmd = cmd.inherit_stdin();
 
     if let Some(path) = directives.cd_file {
         cmd = cmd.directive_cd_file(path);

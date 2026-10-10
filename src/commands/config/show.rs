@@ -133,7 +133,7 @@ pub fn handle_config_show(full: bool, format: SwitchFormat) -> anyhow::Result<()
     render_runtime_info(&mut show_output)?;
 
     // Display through pager (config show is always long-form output)
-    show_help_in_pager(&show_output, true);
+    show_help_in_pager(&show_output, true)?;
 
     if invalid {
         return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
@@ -1192,7 +1192,7 @@ fn render_fish_completion_status(out: &mut String, cmd: &str) -> anyhow::Result<
     };
     let completion_display = format_path_for_display(&completion_path);
     let shell = Shell::Fish;
-    if completion_path.exists() {
+    if completion_path.is_file() {
         writeln!(
             out,
             "{}",

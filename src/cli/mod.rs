@@ -1510,7 +1510,7 @@ $ wt merge --no-commit --no-rebase
 `wt merge` runs these steps:
 
 1. **Commit** — Pre-commit hooks run, then uncommitted changes are committed. Post-commit hooks run in the background. This step is skipped when squashing (the default) — changes are staged during the squash step instead. With `--no-squash`, this is the only commit step.
-2. **Squash** — Combines all commits since target into one (like GitHub's "Squash and merge"). Use `--stage` to control what gets staged: `all` (default), `tracked`, or `none`. Working-tree changes swept into the squash are backed up first to `refs/wt-backup/<branch>`. With `--no-squash`, individual commits are preserved.
+2. **Squash** — Combines all commits since target into one (like GitHub's "Squash and merge"). Use `--stage` to control what gets staged: `all` (default), `tracked`, or `none`. Working-tree changes swept into the squash are backed up first to `refs/wt-backup/<branch>`; see [`wt step squash`](/step/#wt-step-squash) for recovery. With `--no-squash`, individual commits are preserved.
 3. **Rebase** — Rebases onto target, skipping when nothing needs replaying ([`wt step rebase`](/step/#wt-step-rebase) gives the conditions). A conflict stops the merge with the rebase left open in the worktree, to resolve or abort. With `--no-rebase`, the graph produced by earlier commit/squash steps is preserved and the target must be able to fast-forward to its tip.
 4. **Pre-merge hooks** — Hooks run after rebase, before merge. Failures abort. See [`wt hook`](/hook/).
 5. **Merge** — Fast-forward merge to the target branch ([`wt step push`](/step/#wt-step-push)). With `--no-ff`, a merge commit is created instead — semi-linear history after the default rebase, while explicit `--no-rebase` preserves the graph produced by earlier steps before adding the merge commit. Non-fast-forward merges are rejected.
@@ -1880,21 +1880,33 @@ The `worktree_path_of_branch` function returns the filesystem path of a worktree
 setup = "cp {{ worktree_path_of_branch('main') }}/config.local {{ worktree_path }}"
 ```
 
-## JSON context
+## Interactive hooks
 
-Hooks receive all template variables as JSON on stdin, enabling complex logic that templates can't express. Variables that are unset in a template are absent from the JSON too, so read the optional ones with a default — `branch` has none in a detached worktree:
+A hook running in the foreground inherits wt's stdin, so it can ask before continuing:
 
 ```toml
 # .config/wt.toml
 [pre-start]
-setup = "python3 scripts/pre-start-setup.py"
+trust = "gum confirm 'trust this worktree?' && mise trust"
+```
+
+That covers `pre-*` hooks and any type under `wt hook <type> --foreground`, except where the hook is a concurrent group — a table with two or more keys, whose children would race for the terminal, so each reads EOF instead. A detached `post-*` hook reads EOF too, having no terminal at all. Nothing is ever piped in — a hook reads its context through template variables, whatever form it runs in.
+
+Foreground steps run in order and share one stdin, so a step that drains it to EOF — a `cat` or a `read` loop — leaves nothing for the steps behind it when that stdin is a pipe or a file. Under a terminal each step can prompt in turn. Steps accumulate across config files, so a user `[pre-start]` and a project `[pre-start]` form one pipeline.
+
+Logic that templates can't express belongs in a script, with the values it needs passed as arguments:
+
+```toml
+# .config/wt.toml
+[post-start]
+setup = "python3 scripts/post-start-setup.py {{ branch }} {{ repo }}"
 ```
 
 ```python
-# scripts/pre-start-setup.py
-import json, sys, subprocess
-ctx = json.load(sys.stdin)
-if ctx.get('branch', '').startswith('feature/') and 'backend' in ctx['repo']:
+# scripts/post-start-setup.py
+import subprocess, sys
+branch, repo = sys.argv[1], sys.argv[2]
+if branch.startswith('feature/') and 'backend' in repo:
     subprocess.run(['make', 'seed-db'])
 ```
 

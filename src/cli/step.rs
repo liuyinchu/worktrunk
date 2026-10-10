@@ -134,6 +134,12 @@ Three sections are printed: the rendered prompt, the shell command that would in
 
 The squash commit is made on a detached HEAD, as `git rebase` does, so git's own commit hooks run and see no current branch.
 
+## Recovering staged changes
+
+Before absorbing staged changes, Worktrunk backs up the index to `refs/wt-backup/<branch>`. The backup commit's parent preserves the branch tip before squashing. Unstaged and untracked files outside the selected staging mode stay in the original worktree and are not captured by the backup.
+
+The output prints the backup ref and a command to open its saved commit on a recovery branch in a new worktree. That command uses the backup's immutable SHA and skips project hooks. It preserves current branches, files, and staging, and also works after `wt merge` removes the source worktree.
+
 ## Options
 
 ### Staging
@@ -508,7 +514,7 @@ feature/auth
     ///
     /// Executes sequentially with real-time output; continues past command failures.
     #[command(
-        after_long_help = r#"A summary of successes and failures is shown at the end. Context JSON — a flat object of every template variable — is piped to stdin for scripts that need structured data.
+        after_long_help = r#"A summary of successes and failures is shown at the end. Context JSON — a flat object of every template variable — is provided on stdin for scripts that need structured data.
 
 ## Arguments
 

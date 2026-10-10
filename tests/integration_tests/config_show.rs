@@ -957,7 +957,13 @@ fn test_config_show_fish_with_completions(mut repo: TestRepo, temp_home: TempDir
 
 /// Test that config show displays fish shell without completions configured
 #[rstest]
-fn test_config_show_fish_without_completions(mut repo: TestRepo, temp_home: TempDir) {
+#[case(false)]
+#[case(true)]
+fn test_config_show_fish_without_completions(
+    mut repo: TestRepo,
+    temp_home: TempDir,
+    #[case] completion_directory: bool,
+) {
     // Setup mock gh/glab for deterministic BINARIES output
     repo.setup_mock_ci_tools_unauthenticated();
 
@@ -976,7 +982,11 @@ fn test_config_show_fish_without_completions(mut repo: TestRepo, temp_home: Temp
     let wrapper_content = init.generate_fish_wrapper().unwrap();
     fs::write(&fish_config, format!("{}\n", wrapper_content)).unwrap();
 
-    // Do NOT create fish completions file - completions not configured
+    // A missing completion file and a directory at its path must both leave
+    // the installed wrapper visible, with completions not configured.
+    if completion_directory {
+        fs::create_dir_all(temp_home.path().join(".config/fish/completions/wt.fish")).unwrap();
+    }
 
     let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
     settings.bind(|| {
@@ -985,7 +995,7 @@ fn test_config_show_fish_without_completions(mut repo: TestRepo, temp_home: Temp
         set_temp_home_env(&mut cmd, temp_home.path());
         set_xdg_config_path(&mut cmd, temp_home.path());
 
-        assert_cmd_snapshot!(cmd);
+        assert_cmd_snapshot!("config_show_fish_without_completions", cmd);
     });
 }
 
@@ -1759,6 +1769,63 @@ fn test_config_show_full_azure_remote(
 
         assert_cmd_snapshot!(snapshot_name, cmd);
     });
+}
+
+/// Azure CLI's WinGet install puts `az.cmd` on PATH beside an extensionless
+/// bash script, with no `az.exe`. A bare `az` spawn has to reach the batch
+/// launcher, or `wt` reports an installed CLI as missing (#4401).
+#[cfg(windows)]
+#[rstest]
+fn test_config_show_finds_batch_launcher_az(mut repo: TestRepo, temp_home: TempDir) {
+    use crate::common::mock_commands::MockConfig;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    let mock_bin = repo.mock_bin_path().unwrap().to_path_buf();
+    fs::write(
+        mock_bin.join("az_extensions.json"),
+        r#"[{"name": "azure-devops", "version": "1.0.0"}]"#,
+    )
+    .unwrap();
+    // The mock answers under another name, so the only `az` on the mock
+    // directory is the launcher pair WinGet installs.
+    MockConfig::new("azmock")
+        .version("azure-cli 2.60.0 (mock)")
+        .command("account show", MockResponse::exit(0))
+        .command("extension list", MockResponse::file("az_extensions.json"))
+        .command("_default", MockResponse::exit(1))
+        .write(&mock_bin);
+    let _ = fs::remove_file(mock_bin.join("az.exe"));
+    fs::write(mock_bin.join("az.cmd"), "@\"%~dp0azmock.exe\" %*\r\n").unwrap();
+    fs::write(
+        mock_bin.join("az"),
+        "#!/usr/bin/env bash\nexec \"$(dirname \"$0\")/azmock.exe\" \"$@\"\n",
+    )
+    .unwrap();
+
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://dev.azure.com/myorg/myproject/_git/test-repo",
+    ]);
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_LATEST_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.args(["config", "show", "--full"])
+        .current_dir(repo.root_path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    let output = cmd.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = text.ansi_strip();
+    assert!(
+        text.contains("az installed & authenticated"),
+        "az.cmd was not found:\n{text}"
+    );
 }
 
 #[rstest]
